@@ -245,7 +245,8 @@ def _merchant_message(category, merchant, trigger):
             details.append(f"manufacturer {manufacturer}")
         if batches:
             details.append(f"affected batches {', '.join(map(str, batches))}")
-        return f"{owner}, there’s a {alert}{f' ({'; '.join(details)})' if details else ''}. Please verify the listed batches against the official notice before taking action. Want me to format a stock-check checklist?", "binary_yes_no", "Relays only the supplied alert identifiers and asks for verification, without giving patient treatment advice."
+        detail_text = f" ({'; '.join(details)})" if details else ""
+        return f"{owner}, there’s a {alert}{detail_text}. Please verify the listed batches against the official notice before taking action. Want me to format a stock-check checklist?", "binary_yes_no", "Relays only the supplied alert identifiers and asks for verification, without giving patient treatment advice."
 
     if kind == "category_seasonal":
         trends = payload.get("trends") or []
