@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
+import re
 import time
 import uuid
 
@@ -95,7 +96,12 @@ def _reply(payload):
         return {"action": "end", "rationale": "Repeated automated replies with no owner engagement; closing to avoid wasting turns."}
 
     # Explicit intent should immediately move to a concrete next step.
-    positive = any(x in lower for x in ("yes", "yeah", "ok", "okay", "let's do", "lets do", "go ahead", "please do", "interested", "send it", "sounds good", "sure"))
+    positive = bool(re.search(
+        r"\b(yes|yeah|ok|okay|sure|go ahead|please do|do it|let'?s do|"
+        r"sounds good|send it|i want to join|join magicpin|sign me up|"
+        r"update my (google )?profile|please update|start now)\b",
+        lower,
+    ))
     if positive:
         conv["auto_reply_count"] = 0
         merchant_id = payload.get("merchant_id") or conv.get("merchant_id")

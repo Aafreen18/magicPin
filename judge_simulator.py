@@ -644,11 +644,16 @@ class JudgeSimulator:
             status = "PASS" if data and data.get("accepted") else "FAIL"
             print(f"  [{status}] category/{slug}")
 
-        for mid, m in list(self.dataset.merchants.items())[:5]:
+        for mid, m in self.dataset.merchants.items():
             data, err, _ = self.client.push_context("merchant", mid, 1, m)
             status = "PASS" if data and data.get("accepted") else "FAIL"
             short_id = mid.split('_')[1] if '_' in mid else mid[:10]
             print(f"  [{status}] merchant/{short_id}")
+
+        for customer_id, customer in self.dataset.customers.items():
+            data, err, _ = self.client.push_context("customer", customer_id, 1, customer)
+            status = "PASS" if data and data.get("accepted") else "FAIL"
+            print(f"  [{status}] customer/{customer_id}")
 
         return True
 
@@ -785,8 +790,9 @@ class JudgeSimulator:
 
     def _all(self) -> bool:
         results = []
-        for name, fn in [("warmup", self._warmup), ("auto_reply", self._auto_reply),
-                         ("intent", self._intent), ("hostile", self._hostile)]:
+        for name, fn in [("warmup", self._warmup), ("tick", self._phase2_short),
+                         ("auto_reply", self._auto_reply), ("intent", self._intent),
+                         ("hostile", self._hostile)]:
             try:
                 results.append((name, fn()))
             except Exception as e:
