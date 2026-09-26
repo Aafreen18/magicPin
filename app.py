@@ -4,10 +4,10 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import hashlib
 import os
 import re
 import time
-import uuid
 
 from bot import compose
 
@@ -16,6 +16,7 @@ CONTEXTS = {"category": {}, "merchant": {}, "customer": {}, "trigger": {}}
 VERSIONS = {"category": {}, "merchant": {}, "customer": {}, "trigger": {}}
 CONVERSATIONS = {}
 SENT_SUPPRESSIONS = set()
+OPTED_OUT = set()
 AUTO_REPLY_COUNTS = {}
 LOCK = __import__("threading").RLock()
 VALID_SCOPES = set(CONTEXTS)
@@ -32,6 +33,48 @@ METADATA = {
 
 def _now():
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _parse_time(value):
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed
+    except (TypeError, ValueError):
+        return None
+
+
+def _trigger_priority(trigger, merchant, category, customer):
+    """Stable, context-based ordering so a tick sends its best actions first."""
+    urgency = trigger.get("urgency", 1)
+    try:
+        score = max(1, min(5, int(urgency))) * 10
+    except (TypeError, ValueError):
+        score = 10
+    kind = str(trigger.get("kind", ""))
+    payload = trigger.get("payload") or {}
+    signals = " ".join(map(str, merchant.get("signals") or [])).lower()
+
+    # Prefer triggers that line up with a current merchant signal or category data.
+    if kind in {"perf_dip", "seasonal_perf_dip"} and ("dip" in signals or payload.get("delta_pct") is not None):
+        score += 18
+    if kind == "perf_spike" and ("spike" in signals or payload.get("delta_pct") is not None):
+        score += 16
+    if kind in {"research_digest", "regulation_change", "category_trend", "trend_movement"}:
+        if category.get("digest") or category.get("trend_signals"):
+            score += 12
+    if kind in {"recall_due", "appointment_tomorrow", "chronic_refill_due"} and customer:
+        score += 15
+    if kind == "active_planning_intent":
+        score += 20
+    if merchant.get("conversation_history"):
+        last = merchant["conversation_history"][-1]
+        engagement = str(last.get("engagement", "")).lower() if isinstance(last, dict) else ""
+        if engagement in {"merchant_replied", "engaged", "positive"}:
+            score += 5
+    # Break ties predictably by trigger ID in the caller.
+    return score
 
 
 def _find_merchant_for_trigger(trigger):
@@ -72,9 +115,19 @@ def _reply(payload):
     if stop:
         conv["ended"] = True
         conv["opted_out"] = True
-        return {"action": "end", "rationale": "Merchant asked to stop or declined; closing the conversation and suppressing this merchant's future outreach."}
+        role = payload.get("from_role", "merchant")
+        audience_id = payload.get("customer_id") if role == "customer" else (payload.get("merchant_id") or conv.get("merchant_id"))
+        if audience_id:
+            OPTED_OUT.add((role if role in {"merchant", "customer"} else "merchant", audience_id))
+        return {"action": "end", "rationale": "Recipient asked to stop; closing the conversation and suppressing future outreach to that recipient."}
     if conv.get("ended"):
         return {"action": "end", "rationale": "This conversation is already closed."}
+
+    if payload.get("from_role") == "customer":
+        if any(word in lower for word in ("yes", "sure", "okay", "ok", "please share")):
+            conv["ended"] = True
+            return {"action": "send", "body": "Thanks — the business can follow up with the information you requested.", "cta": "none", "rationale": "Acknowledges the customer’s request and avoids promising details the bot does not have."}
+        return {"action": "end", "rationale": "Keeps customer follow-up limited to the requested, consented message and avoids extending the conversation without grounded details."}
 
     auto = any(phrase in lower for phrase in (
         "thank you for contacting", "thanks for contacting", "our team will respond",
@@ -108,12 +161,13 @@ def _reply(payload):
         if merchant_id:
             AUTO_REPLY_COUNTS[merchant_id] = 0
         conv["last_merchant_message"] = msg
-        return {"action": "send", "body": "Great — I’ll prepare the next step using the details already available. I’ll share the draft here for your review before anything is sent or published.", "cta": "binary_confirm_cancel", "rationale": "Recognizes clear intent and routes directly to a concrete draft/action without restarting qualification."}
+        topic = conv.get("trigger_kind", "the item we discussed").replace("_", " ")
+        return {"action": "send", "body": f"Great. I’ll prepare the next step for {topic} using the details already available, then share a draft here for your review.", "cta": "binary_confirm_cancel", "rationale": "Recognizes clear intent and moves directly to a reviewable next step tied to the original trigger."}
 
-    if any(x in lower for x in ("who are you", "what is this", "why", "help me", "how does")):
+    if any(x in lower for x in ("who are you", "what is this", "why", "help me", "how does", "what do you mean", "which details")):
         return {"action": "send", "body": "I’m Vera, magicpin’s merchant assistant. I can help with your profile, offers, customer updates, and the specific topic in my last message. Which part should I take forward?", "cta": "open_ended", "rationale": "Answers the question and offers an in-scope next step."}
 
-    if any(x in lower for x in ("later", "busy", "not now", "tomorrow")):
+    if any(x in lower for x in ("later", "busy", "not now", "tomorrow", "next week", "remind me")):
         return {"action": "wait", "wait_seconds": 14400, "rationale": "Merchant asked to defer; pausing instead of sending another pitch."}
 
     return {"action": "send", "body": "Understood. I can help with the specific item I mentioned; tell me which detail you want me to clarify.", "cta": "open_ended", "rationale": "Keeps the conversation on the original trigger and invites clarification without inventing facts."}
@@ -138,8 +192,8 @@ class Handler(BaseHTTPRequestHandler):
     def _read_json(self):
         try:
             length = int(self.headers.get("Content-Length", "0"))
-            if length <= 0 or length > 5_000_000:
-                raise ValueError("Content-Length must be between 1 and 5000000")
+            if length <= 0 or length > 500_000:
+                raise ValueError("Content-Length must be between 1 and 500000")
             data = json.loads(self.rfile.read(length).decode("utf-8"))
             if not isinstance(data, dict):
                 raise ValueError("JSON body must be an object")
@@ -185,16 +239,14 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/v1/tick":
             now = payload.get("now") or _now()
             ids = payload.get("available_triggers", [])
-            if not isinstance(ids, list):
+            if not isinstance(ids, list) or any(not isinstance(item, str) for item in ids):
                 return self._send(400, {"error": "available_triggers_must_be_list"})
-            actions = []
+            candidates = []
             with LOCK:
-                for trigger_id in ids:
+                current_time = _parse_time(now)
+                for trigger_id in sorted(set(ids), key=str):
                     trigger = CONTEXTS["trigger"].get(trigger_id)
                     if not trigger:
-                        continue
-                    suppression = trigger.get("suppression_key") or trigger_id
-                    if suppression in SENT_SUPPRESSIONS:
                         continue
                     mid, merchant = _find_merchant_for_trigger(trigger)
                     if not merchant:
@@ -205,13 +257,28 @@ class Handler(BaseHTTPRequestHandler):
                         continue
                     customer_id = trigger.get("customer_id")
                     customer = CONTEXTS["customer"].get(customer_id) if customer_id else None
-                    # Do not dispatch customer messaging without explicit matching consent.
-                    if trigger.get("scope") == "customer" and not customer:
+                    customer_scope = trigger.get("scope") == "customer"
+                    # A customer record must belong to this merchant; never cross-send.
+                    if customer_scope and (not customer or (customer.get("merchant_id") and customer["merchant_id"] != mid)):
+                        continue
+                    if customer_scope and ("customer", customer_id) in OPTED_OUT:
+                        continue
+                    if not customer_scope and ("merchant", mid) in OPTED_OUT:
+                        continue
+                    suppression = trigger.get("suppression_key") or trigger_id
+                    audience = customer_id if customer_scope else mid
+                    suppression_identity = ("customer" if customer_scope else "merchant", audience, suppression)
+                    if suppression_identity in SENT_SUPPRESSIONS:
+                        continue
+                    expiry = _parse_time(trigger.get("expires_at"))
+                    if expiry and current_time and expiry <= current_time:
                         continue
                     result = compose(category, merchant, trigger, customer)
                     if not result.get("body", "").strip():
                         continue
-                    cid = "conv_" + uuid.uuid4().hex[:20]
+                    score = _trigger_priority(trigger, merchant, category, customer)
+                    cid_seed = f"{mid}:{customer_id or ''}:{trigger_id}"
+                    cid = "conv_" + hashlib.sha256(cid_seed.encode("utf-8")).hexdigest()[:20]
                     action = {
                         "conversation_id": cid,
                         "merchant_id": mid,
@@ -225,9 +292,19 @@ class Handler(BaseHTTPRequestHandler):
                         "suppression_key": suppression,
                         "rationale": result["rationale"],
                     }
+                    candidates.append((score, str(trigger_id), action, suppression_identity, {
+                        "merchant_id": mid, "customer_id": customer_id, "trigger_id": trigger_id,
+                        "trigger_kind": trigger.get("kind", ""), "body": result["body"],
+                        "auto_reply_count": 0, "ended": False, "created_at": now,
+                    }))
+                candidates.sort(key=lambda item: (-item[0], item[1]))
+                actions = []
+                for _, _, action, suppression_identity, conversation in candidates[:20]:
+                    if suppression_identity in SENT_SUPPRESSIONS:
+                        continue
                     actions.append(action)
-                    CONVERSATIONS[cid] = {"merchant_id": mid, "customer_id": customer_id, "trigger_id": trigger_id, "body": result["body"], "auto_reply_count": 0, "ended": False, "created_at": now}
-                    SENT_SUPPRESSIONS.add(suppression)
+                    CONVERSATIONS[action["conversation_id"]] = conversation
+                    SENT_SUPPRESSIONS.add(suppression_identity)
             return self._send(200, {"actions": actions})
 
         if self.path == "/v1/reply":
