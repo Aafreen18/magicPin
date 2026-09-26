@@ -34,6 +34,3 @@ python3 judge_simulator.py
 unset OPENROUTER_API_KEY
 ```
 
-## Deploy and submit
-
-Publish the project files to a Git repository without secrets. Create a public web service from that repository and select Docker to build the included `Dockerfile`. Once live, verify `/v1/healthz` and `/v1/metadata` on the HTTPS address. Submit the **base URL** (for example, `https://your-service.onrender.com`) in the challenge form—not a route or repository URL—and keep the service available during evaluation. See Render’s [Web Services guide](https://render.com/docs/web-services).
